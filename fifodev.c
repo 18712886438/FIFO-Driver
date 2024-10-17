@@ -5,19 +5,18 @@
 #include <linux/kfifo.h>
 #include <linux/uaccess.h> /*copy to user, copy from user */
 #include <linux/cdev.h>
+#include <linux/device.h>
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Carlos Bilbao");
 MODULE_DESCRIPTION("Linux kernel module simulating a FIFO file via char file at /dev");
 
-//#define MODULE_NAME 	"fifoproc"
-#define MAX_KBUF     	 36
-#define MAX_CBUFFER_LEN  64
+#define MAX_KBUF     	 4096
+#define MAX_CBUFFER_LEN  4096
 #define DEVICE_NAME      "fifodev" /* Dev name as it appears in /proc/devices */
 
-//static struct proc_dir_entry *my_proc_entry;
-
 /* FIFO Resources */
-struct kfifo cbuffer;		/* Circular buffer (64 bytes)*/
+struct kfifo cbuffer;		/* Circular buffer (4096 bytes)*/
 int prod_count = 0; 		/* # Threads that openned /proc for writting (producers) */
 int cons_count = 0; 		/* # Threads that openned /proc for reading (consumers) */
 struct semaphore mtx; 		/* Guarantees mutual exclusion at critical sections */
@@ -29,13 +28,13 @@ int nr_cons_waiting = 0;	/* # Consumer threads waiting */
 /* Device Resources */
 dev_t start;			/* Starting (major,minor) pair for the driver */
 struct cdev* chardev = NULL;    /* Cdev structure associated with the driver */
+struct class *dev_class;        /* Device class */
 
 //* --------------------- FIFO Functions --------------------- *//
 
 /* Auxiliar function ~ home-made kernel-level cond_wait()*/
 static int cond_wait(int *prod)
 {
-
 	struct semaphore *aux;
 	int *counter;
 
@@ -60,7 +59,6 @@ static int cond_wait(int *prod)
 /* Invoked when doing open() at /dev entry */
 static int fifoproc_open(struct inode *in, struct file *f)
 {
-
 	int isProducer;
 
 	/* lock */
@@ -105,7 +103,6 @@ static int fifoproc_open(struct inode *in, struct file *f)
 /* Invoked when doing close() at /dev entry */
 static int fifoproc_release(struct inode *i, struct file *f)
 {
-
 	/* lock */
 	if (down_interruptible(&mtx)) return -EINTR;
 
@@ -135,7 +132,6 @@ static int fifoproc_release(struct inode *i, struct file *f)
 /* Invoked when doing read() at /dev entry */
 static ssize_t fifoproc_read(struct file *f, char *buff, size_t size, loff_t *l)
 {
-
 	char kbuffer[MAX_KBUF];
 	int isProducer = 0, len;
 
@@ -175,7 +171,6 @@ static ssize_t fifoproc_read(struct file *f, char *buff, size_t size, loff_t *l)
 /* Invoked when doing write() at /dev entry */
 static ssize_t fifoproc_write(struct file *f,const char *buff, size_t size, loff_t *l)
 {
-
 	char kbuffer[MAX_KBUF];
 	int isProducer = 1;
 
@@ -219,9 +214,7 @@ const struct file_operations fops = {
 
 int modulo_fifo_init(void)
 {
-
 	int ret = 0, major, minor; /* major associated with device driver, minor with character device */
-	//my_proc_entry = proc_create("fifoproc", 0666, NULL, &fops); //Create proc entry
 
 	if ((ret = alloc_chrdev_region(&start, 0, 1, DEVICE_NAME)) || (kfifo_alloc(&cbuffer, MAX_CBUFFER_LEN, GFP_KERNEL))) {
 		ret = -ENOMEM;
@@ -241,6 +234,21 @@ int modulo_fifo_init(void)
 		sema_init(&mtx,1); /* As mutex */
 		sema_init(&sem_prod, 0); /* As waiting queues */
 		sema_init(&sem_cons, 0);
+
+		/* Create device class */
+		dev_class = class_create(THIS_MODULE, DEVICE_NAME);
+		if (IS_ERR(dev_class)) {
+			printk(KERN_INFO "Failed to create device class\n");
+			return PTR_ERR(dev_class);
+		}
+
+		/* Create device file */
+		if (device_create(dev_class, NULL, start, NULL, DEVICE_NAME) == NULL) {
+			printk(KERN_INFO "Failed to create device file\n");
+			class_destroy(dev_class);
+			return -ENOMEM;
+		}
+
 		printk(KERN_INFO "Module %s charged: major = %d, minor = %d\n", DEVICE_NAME,major,minor);
 	}
 
@@ -249,7 +257,6 @@ int modulo_fifo_init(void)
 
 void modulo_fifo_exit(void) 
 {
-
 	if (chardev) cdev_del(chardev);
 
 	/* Unregister the device */
@@ -257,7 +264,11 @@ void modulo_fifo_exit(void)
 
 	/* Free the memory */
 	kfifo_free(&cbuffer);
-	//remove__entry("fifoproc", NULL);
+
+	/* Destroy device file and class */
+	device_destroy(dev_class, start);
+	class_destroy(dev_class);
+
    	printk(KERN_INFO "Module %s disconnected \n", DEVICE_NAME);
 }
 
